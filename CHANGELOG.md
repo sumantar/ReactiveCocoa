@@ -1,3 +1,10 @@
+# master
+*Please put new entries at the top.
+
+1. Intercept delegate calls with `DelegateProxy`. It can be constructed via `NSObject.reactive.proxy(forKey:)`. (#3467, kudos to @andersio)
+
+   Note that `DelegateProxy` does not support protocols containing methods that are non-void returning. It would trap immediately when the proxy initializes with a protocol containing such a required method, or when the proxy is asked to intercept such an optional method.
+
 # 5.0
 
 ### Table of Contents
