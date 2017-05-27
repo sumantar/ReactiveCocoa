@@ -141,7 +141,7 @@ extension NSObject {
 private func enableMessageForwarding(_ realClass: AnyClass, _ selectorCache: SelectorCache) {
 	let perceivedClass: AnyClass = class_getSuperclass(realClass)
 
-	typealias ForwardInvocationImpl = @convention(block) (Unmanaged<NSObject>, AnyObject) -> Void
+	typealias ForwardInvocationImpl = @convention(block) (AnyObject, AnyObject) -> Void
 	let newForwardInvocation: ForwardInvocationImpl = { objectRef, invocation in
 		let selector = invocation.selector!
 		let alias = selectorCache.alias(for: selector)
@@ -149,7 +149,7 @@ private func enableMessageForwarding(_ realClass: AnyClass, _ selectorCache: Sel
 
 		defer {
 			let stateKey = AssociationKey<InterceptingState?>(alias)
-			if let state = objectRef.takeUnretainedValue().associations.value(forKey: stateKey) {
+			if let state = Associations(objectRef).value(forKey: stateKey) {
 				state.observer.send(value: invocation)
 			}
 		}
@@ -167,7 +167,7 @@ private func enableMessageForwarding(_ realClass: AnyClass, _ selectorCache: Sel
 			//
 			// However, the IMP cache would be thrashed due to the swapping.
 
-			let topLevelClass: AnyClass = object_getClass(objectRef.takeUnretainedValue())
+			let topLevelClass: AnyClass = object_getClass(objectRef)
 
 			// The locking below prevents RAC swizzling attempts from intervening the
 			// invocation.
@@ -226,7 +226,7 @@ private func enableMessageForwarding(_ realClass: AnyClass, _ selectorCache: Sel
 		// Forward the invocation to the closest `forwardInvocation(_:)` in the
 		// inheritance hierarchy, or the default handler returned by the runtime
 		// if it finds no implementation.
-		typealias SuperForwardInvocation = @convention(c) (Unmanaged<NSObject>, Selector, AnyObject) -> Void
+		typealias SuperForwardInvocation = @convention(c) (AnyObject, Selector, AnyObject) -> Void
 		let impl = class_getMethodImplementation(perceivedClass, ObjCSelector.forwardInvocation)
 		let forwardInvocation = unsafeBitCast(impl, to: SuperForwardInvocation.self)
 		forwardInvocation(objectRef, ObjCSelector.forwardInvocation, invocation)
@@ -247,12 +247,12 @@ private func enableMessageForwarding(_ realClass: AnyClass, _ selectorCache: Sel
 private func setupMethodSignatureCaching(_ realClass: AnyClass, _ signatureCache: SignatureCache) {
 	let perceivedClass: AnyClass = class_getSuperclass(realClass)
 
-	let newMethodSignatureForSelector: @convention(block) (Unmanaged<NSObject>, Selector) -> AnyObject? = { objectRef, selector in
+	let newMethodSignatureForSelector: @convention(block) (AnyObject, Selector) -> AnyObject? = { objectRef, selector in
 		if let signature = signatureCache[selector] {
 			return signature
 		}
 
-		typealias SuperMethodSignatureForSelector = @convention(c) (Unmanaged<NSObject>, Selector, Selector) -> AnyObject?
+		typealias SuperMethodSignatureForSelector = @convention(c) (AnyObject, Selector, Selector) -> AnyObject?
 		let impl = class_getMethodImplementation(perceivedClass, ObjCSelector.methodSignatureForSelector)
 		let methodSignatureForSelector = unsafeBitCast(impl, to: SuperMethodSignatureForSelector.self)
 		return methodSignatureForSelector(objectRef, ObjCSelector.methodSignatureForSelector, selector)

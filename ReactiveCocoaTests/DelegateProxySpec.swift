@@ -4,10 +4,24 @@ import enum Result.NoError
 import ReactiveSwift
 @testable import ReactiveCocoa
 
-@objc internal protocol ObjectDelegate: NSObjectProtocol {
+@objc private protocol ObjectDelegate: NSObjectProtocol {
 	func foo()
 	@objc optional func bar()
 	@objc optional func nop()
+}
+
+@objc internal protocol InternalObjectDelegate: NSObjectProtocol {
+	func foo()
+}
+
+@objc public protocol PublicObjectDelegate: NSObjectProtocol {
+	func foo()
+}
+
+private class RemanglingTestHelper: NSObject {
+	dynamic weak var privateDelegate: ObjectDelegate?
+	dynamic weak var internalDelegate: InternalObjectDelegate?
+	dynamic weak var publicDelegate: PublicObjectDelegate?
 }
 
 private class Object: NSObject {
@@ -52,6 +66,81 @@ private class ObjectDelegateCounter: NSObject, ObjectDelegate {
 	}
 }
 
+@objc private protocol ArbitraryReturningDelegate: NSObjectProtocol {
+	func foo() -> Int
+	func bar() -> Double
+	func nop()
+}
+
+private class TestProxyNonConformingInvalidSubclass: DelegateProxy<ArbitraryReturningDelegate> {
+	var fooCounter = 0
+
+	func foo() -> Int {
+		fooCounter += 1
+		return forwardee?.foo() ?? 2048
+	}
+}
+
+private class TestProxyNonConformingSubclass: DelegateProxy<ArbitraryReturningDelegate> {
+	var fooCounter = 0
+	var barCounter = 0
+
+	func foo() -> Int {
+		fooCounter += 1
+		return forwardee?.foo() ?? 2048
+	}
+
+	func bar() -> Double {
+		barCounter += 1
+		return forwardee?.bar() ?? 2048.0
+	}
+}
+
+private class TestProxyConformingSubclass: DelegateProxy<ArbitraryReturningDelegate>, ArbitraryReturningDelegate {
+	var fooCounter = 0
+	var barCounter = 0
+	var nopCounter = 0
+
+	func foo() -> Int {
+		fooCounter += 1
+		return forwardee?.foo() ?? 2048
+	}
+
+	func bar() -> Double {
+		barCounter += 1
+		return forwardee?.bar() ?? 2048.0
+	}
+
+	func nop() {
+		forwardee?.nop()
+		nopCounter += 1
+	}
+}
+
+private class ArbitraryReturningCounter: NSObject, ArbitraryReturningDelegate {
+	var fooCounter = 0
+	var barCounter = 0
+	var nopCounter = 0
+
+	func foo() -> Int {
+		fooCounter += 1
+		return 1024
+	}
+
+	func bar() -> Double {
+		barCounter += 1
+		return 1024.0
+	}
+
+	func nop() {
+		nopCounter += 1
+	}
+}
+
+private class ArbitraryReturningTestHelper: NSObject {
+	dynamic weak var delegate: ArbitraryReturningDelegate?
+}
+
 class DelegateProxySpec: QuickSpec {
 	override func spec() {
 		describe("DelegateProxy") {
@@ -65,13 +154,48 @@ class DelegateProxySpec: QuickSpec {
 
 			afterEach {
 				weak var weakObject = object
+				weak var weakProxy = proxy
 
-				object = nil
+				autoreleasepool {
+					object = nil
+					proxy = nil
+				}
+
 				expect(weakObject).to(beNil())
+				expect(weakProxy).to(beNil())
+			}
+
+			it("should respond to the protocol requirement checks.") {
+				expect(proxy.conforms(to: ObjectDelegate.self)) == true
+				expect(proxy.responds(to: #selector(ObjectDelegate.foo))) == true
+				expect(proxy.responds(to: #selector(ObjectDelegate.bar))) == false
+				expect(proxy.responds(to: #selector(ObjectDelegate.nop))) == false
+			}
+
+			it("should create proxies without issue") {
+				let testHelper = RemanglingTestHelper()
+				let _: DelegateProxy<ObjectDelegate> = testHelper.reactive.proxy(forKey: #keyPath(RemanglingTestHelper.privateDelegate))
+				let _: DelegateProxy<InternalObjectDelegate> = testHelper.reactive.proxy(forKey: #keyPath(RemanglingTestHelper.internalDelegate))
+				let _: DelegateProxy<PublicObjectDelegate> = testHelper.reactive.proxy(forKey: #keyPath(RemanglingTestHelper.publicDelegate))
 			}
 
 			it("should be automatically set as the object's delegate.") {
 				expect(object.delegate).to(beIdenticalTo(proxy))
+			}
+
+			it("should not retain the delegate") {
+				var counter: ObjectDelegateCounter? = ObjectDelegateCounter()
+				weak var weakCounter = counter
+				proxy.forwardee = counter
+
+				object.delegate?.foo()
+				expect(counter?.fooCounter) == 1
+
+				autoreleasepool {
+					counter = nil
+				}
+
+				expect(weakCounter).to(beNil())
 			}
 
 			it("should not be erased when the delegate is set with a new one.") {
@@ -83,12 +207,6 @@ class DelegateProxySpec: QuickSpec {
 				object.delegate = counter
 				expect(object.delegate).to(beIdenticalTo(proxy))
 				expect(proxy.forwardee).to(beIdenticalTo(counter))
-			}
-
-			it("should respond to the protocol requirement checks.") {
-				expect(proxy.responds(to: #selector(ObjectDelegate.foo))) == true
-				expect(proxy.responds(to: #selector(ObjectDelegate.bar))) == false
-				expect(proxy.responds(to: #selector(ObjectDelegate.nop))) == false
 			}
 
 			it("should complete its signals when the object deinitializes") {
@@ -210,7 +328,207 @@ class DelegateProxySpec: QuickSpec {
 				expect(object.delegateSelectors) == [#selector(ObjectDelegate.foo), #selector(ObjectDelegate.bar)]
 				expect(object.delegate).to(beIdenticalTo(proxy))
 			}
-			
+
+			describe("subclassing") {
+				var object: ArbitraryReturningTestHelper!
+
+				beforeEach {
+					object = ArbitraryReturningTestHelper()
+				}
+
+				#if arch(x86_64)
+				it("should trap") {
+					expect {
+						_ = object.reactive.proxy(forKey: #keyPath(ArbitraryReturningTestHelper.delegate)) as TestProxyNonConformingInvalidSubclass
+						return nil
+					}.to(throwAssertion())
+				}
+				#endif
+
+				it("should not retain the delegate") {
+					let proxy = object.reactive.proxy(forKey: #keyPath(ArbitraryReturningTestHelper.delegate)) as TestProxyNonConformingSubclass
+
+					var counter: ArbitraryReturningCounter? = ArbitraryReturningCounter()
+					weak var weakCounter = counter
+					proxy.forwardee = counter
+
+					expect(object.delegate?.foo()) == 1024
+					object.delegate?.nop()
+					expect(counter?.fooCounter) == 1
+
+					autoreleasepool {
+						counter = nil
+					}
+
+					expect(weakCounter).to(beNil())
+				}
+
+				it("should establish a proxy and intercept calls as usual") {
+					let proxy = object.reactive.proxy(forKey: #keyPath(ArbitraryReturningTestHelper.delegate)) as TestProxyNonConformingSubclass
+					let counter = ArbitraryReturningCounter()
+					proxy.forwardee = counter
+
+					var (fooCounter, barCounter, nopCounter) = (0, 0, 0)
+
+					proxy.reactive
+						.trigger(for: #selector(proxy.delegateType.foo))
+						.observeValues {
+							fooCounter += 1
+						}
+
+					proxy.reactive
+						.trigger(for: #selector(proxy.delegateType.bar))
+						.observeValues {
+							barCounter += 1
+						}
+
+
+					proxy.reactive
+						.trigger(for: #selector(proxy.delegateType.nop))
+						.observeValues {
+							nopCounter += 1
+						}
+
+					expect(object.delegate?.foo()) == 1024
+					expect(proxy.fooCounter) == 1
+					expect(counter.fooCounter) == 1
+					expect(fooCounter) == 1
+
+					expect(object.delegate?.foo()) == 1024
+					expect(proxy.fooCounter) == 2
+					expect(counter.fooCounter) == 2
+					expect(fooCounter) == 2
+
+					expect(object.delegate?.bar()) == 1024.0
+					expect(proxy.barCounter) == 1
+					expect(counter.barCounter) == 1
+					expect(barCounter) == 1
+
+					expect(object.delegate?.bar()) == 1024.0
+					expect(proxy.barCounter) == 2
+					expect(counter.barCounter) == 2
+					expect(barCounter) == 2
+
+					object.delegate?.nop()
+					expect(counter.nopCounter) == 1
+					expect(nopCounter) == 1
+
+					object.delegate?.nop()
+					expect(counter.nopCounter) == 2
+					expect(nopCounter) == 2
+
+					proxy.forwardee = nil
+
+					expect(object.delegate?.foo()) == 2048
+					expect(proxy.fooCounter) == 3
+					expect(counter.fooCounter) == 2
+					expect(fooCounter) == 3
+
+					expect(object.delegate?.foo()) == 2048
+					expect(proxy.fooCounter) == 4
+					expect(counter.fooCounter) == 2
+					expect(fooCounter) == 4
+
+					expect(object.delegate?.bar()) == 2048.0
+					expect(proxy.barCounter) == 3
+					expect(counter.barCounter) == 2
+					expect(barCounter) == 3
+
+					expect(object.delegate?.bar()) == 2048.0
+					expect(proxy.barCounter) == 4
+					expect(counter.barCounter) == 2
+					expect(barCounter) == 4
+				}
+
+				it("should establish a proxy and intercept calls as usual") {
+					let proxy = object.reactive.proxy(forKey: #keyPath(ArbitraryReturningTestHelper.delegate)) as TestProxyConformingSubclass
+					let counter = ArbitraryReturningCounter()
+					proxy.forwardee = counter
+
+					var (fooCounter, barCounter, nopCounter) = (0, 0, 0)
+
+					proxy.reactive
+						.trigger(for: #selector(proxy.delegateType.foo))
+						.observeValues {
+							fooCounter += 1
+						}
+
+					proxy.reactive
+						.trigger(for: #selector(proxy.delegateType.bar))
+						.observeValues {
+							barCounter += 1
+						}
+
+					proxy.reactive
+						.trigger(for: #selector(proxy.delegateType.nop))
+						.observeValues {
+							nopCounter += 1
+						}
+
+					expect(object.delegate?.foo()) == 1024
+					expect(proxy.fooCounter) == 1
+					expect(counter.fooCounter) == 1
+					expect(fooCounter) == 1
+
+					expect(object.delegate?.foo()) == 1024
+					expect(proxy.fooCounter) == 2
+					expect(counter.fooCounter) == 2
+					expect(fooCounter) == 2
+
+					expect(object.delegate?.bar()) == 1024.0
+					expect(proxy.barCounter) == 1
+					expect(counter.barCounter) == 1
+					expect(barCounter) == 1
+
+					expect(object.delegate?.bar()) == 1024.0
+					expect(proxy.barCounter) == 2
+					expect(counter.barCounter) == 2
+					expect(barCounter) == 2
+
+					object.delegate?.nop()
+					expect(proxy.nopCounter) == 1
+					expect(counter.nopCounter) == 1
+					expect(nopCounter) == 1
+
+					object.delegate?.nop()
+					expect(proxy.nopCounter) == 2
+					expect(counter.nopCounter) == 2
+					expect(nopCounter) == 2
+
+					proxy.forwardee = nil
+
+					expect(object.delegate?.foo()) == 2048
+					expect(proxy.fooCounter) == 3
+					expect(counter.fooCounter) == 2
+					expect(fooCounter) == 3
+
+					expect(object.delegate?.foo()) == 2048
+					expect(proxy.fooCounter) == 4
+					expect(counter.fooCounter) == 2
+					expect(fooCounter) == 4
+
+					expect(object.delegate?.bar()) == 2048.0
+					expect(proxy.barCounter) == 3
+					expect(counter.barCounter) == 2
+					expect(barCounter) == 3
+
+					expect(object.delegate?.bar()) == 2048.0
+					expect(proxy.barCounter) == 4
+					expect(counter.barCounter) == 2
+					expect(barCounter) == 4
+
+					object.delegate?.nop()
+					expect(proxy.nopCounter) == 3
+					expect(counter.nopCounter) == 2
+					expect(nopCounter) == 3
+
+					object.delegate?.nop()
+					expect(proxy.nopCounter) == 4
+					expect(counter.nopCounter) == 2
+					expect(nopCounter) == 4
+				}
+			}
+
 			describe("interoperability") {
 				var object: Object!
 				var proxy: DelegateProxy<ObjectDelegate>!

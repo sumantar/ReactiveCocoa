@@ -6,49 +6,63 @@ private let hasSwizzledKey = AssociationKey<Bool>(default: false)
 
 public protocol DelegateProxyProtocol: class {}
 
+// This is supposedly private, and is made `internal` to circumvent a serializer bug.
 internal protocol _DelegateProxyProtocol: class {
 	func proxyWillIntercept(_ selector: Selector)
 	var lifetime: Lifetime { get }
 }
 
-public final class DelegateProxy<Delegate: NSObjectProtocol>: NSObject, DelegateProxyProtocol, _DelegateProxyProtocol {
-	public var delegateType: Delegate.Type {
+public struct DelegateProxyConfiguration {
+	fileprivate let objcProtocol: Protocol
+	fileprivate let lifetime: Lifetime
+	fileprivate let originalSetter: (AnyObject) -> Void
+}
+
+open class DelegateProxy<Delegate: NSObjectProtocol>: NSObject, DelegateProxyProtocol, _DelegateProxyProtocol {
+	public final var delegateType: Delegate.Type {
 		return Delegate.self
 	}
 
-	public weak var forwardee: Delegate? {
+	public final weak var forwardee: Delegate? {
+		get { return _forwardee as! Delegate? }
+		set { _forwardee = newValue }
+	}
+
+	fileprivate final weak var _forwardee: AnyObject? {
 		didSet {
 			originalSetter(self)
 		}
 	}
 
-	internal let lifetime: Lifetime
+	internal final let lifetime: Lifetime
 
-	private let writeLock = NSLock()
-	private var interceptedSelectors: Set<Selector> = []
-	private let originalSetter: (AnyObject) -> Void
-	private let objcProtocol: Protocol
+	private final let writeLock = NSLock()
+	private final var interceptedSelectors: Set<Selector> = []
+	private final let originalSetter: (AnyObject) -> Void
+	private final let objcProtocol: Protocol
 
-	fileprivate init(objcProtocol: Protocol, lifetime: Lifetime, originalSetter: @escaping (AnyObject) -> Void) {
-		DelegateProxy<Delegate>.implementRequiredMethods(in: objcProtocol)
+	public required init(config: DelegateProxyConfiguration) {
+		type(of: self).implementRequiredMethods(in: config.objcProtocol)
 
-		self.objcProtocol = objcProtocol
-		self.lifetime = lifetime
-		self.originalSetter = originalSetter
+		objcProtocol = config.objcProtocol
+		lifetime = config.lifetime
+		originalSetter = config.originalSetter
 
 		super.init()
 	}
 
-	public override func forwardingTarget(for selector: Selector!) -> Any? {
-		// This is a fast path for selectors that are not being intercepted.
-		return interceptedSelectors.contains(selector) ? nil : forwardee
+	open override func conforms(to aProtocol: Protocol) -> Bool {
+		return aProtocol === objcProtocol || super.conforms(to: aProtocol)
 	}
 
-	public override func responds(to selector: Selector!) -> Bool {
-		if interceptedSelectors.contains(selector) {
-			return true
-		}
+	// Ideally, `forwardingTarget(for:)` would be the fast path. But apparently it is
+	// leaking memory.
+	//
+	// open override func forwardingTarget(for selector: Selector!) -> Any? {
+	// 	return interceptedSelectors.contains(selector) ? nil : forwardee
+	// }
 
+	open override func responds(to selector: Selector!) -> Bool {
 		return (forwardee?.responds(to: selector) ?? false) || super.responds(to: selector)
 	}
 
@@ -58,9 +72,9 @@ public final class DelegateProxy<Delegate: NSObjectProtocol>: NSObject, Delegate
 	// in `proxyWillIntercept` and `implementRequiredMethods(in:)`, not the runtime
 	// subclass.
 
-	internal func proxyWillIntercept(_ selector: Selector) {
+	internal final func proxyWillIntercept(_ selector: Selector) {
 		let subclass: AnyClass = swizzleClass(self)
-		let perceivedClass: AnyClass = (DelegateProxy<Delegate>.self as AnyObject).objcClass
+		let perceivedClass: AnyClass = (type(of: self) as AnyObject).objcClass
 
 		try! ReactiveCocoa.synchronized(subclass) {
 			if class_getImmediateMethod(perceivedClass, selector) == nil {
@@ -93,24 +107,16 @@ public final class DelegateProxy<Delegate: NSObjectProtocol>: NSObject, Delegate
 		let perceivedClass: AnyClass = (self as AnyObject).objcClass
 		let classAssociations = Associations(perceivedClass as AnyObject)
 
+		var typeEncodings = [Selector: UnsafePointer<Int8>]()
+
 		try! ReactiveCocoa.synchronized(perceivedClass) {
 			guard !classAssociations.value(forKey: delegateProxySetupKey) else {
 				return
 			}
 
-			var count: UInt32 = 0
-			if let list = protocol_copyMethodDescriptionList(objcProtocol, true, true, &count) {
-				let buffer = UnsafeBufferPointer(start: list, count: Int(count))
-				defer { free(list) }
+			defer { classAssociations.setValue(true, forKey: delegateProxySetupKey) }
 
-				for method in buffer {
-					precondition(method.types.pointee == Int8(UInt8(ascii: "v")),
-					             "DelegateProxy does not support protocols with required methods that returns non-void types.")
-
-					_ = class_addMethod(perceivedClass, method.name, _rac_objc_msgForward, method.types)
-				}
-			}
-
+			// Implement `forwardInvocation`.
 			let _forwardInvocation: @convention(block) (Unmanaged<AnyObject>, Unmanaged<AnyObject>) -> Void = { object, invocation in
 				if let forwardee = (object.takeUnretainedValue() as! DelegateProxy<Delegate>).forwardee {
 					let invocation = invocation.takeUnretainedValue()
@@ -125,9 +131,60 @@ public final class DelegateProxy<Delegate: NSObjectProtocol>: NSObject, Delegate
 			                                       ObjCSelector.forwardInvocation,
 			                                       imp_implementationWithBlock(_forwardInvocation),
 			                                       "v@:@")
-			precondition(previousImpl == nil, "Swizzling DelegateProxy with other libraries is not supported.")
+			precondition(previousImpl == nil, "Swizzling DelegateProxy with other libraries is not supported. \(perceivedClass)")
 
-			classAssociations.setValue(true, forKey: delegateProxySetupKey)
+			// Implement `methodSignatureForSelector`.
+			let _methodSignatureForSelector: @convention(block) (Unmanaged<AnyObject>, Selector) -> AnyObject? = { object, selector in
+				let method = class_getInstanceMethod(perceivedClass, selector)
+				let typeEncoding = method.map(method_getTypeEncoding) ?? typeEncodings[selector]
+				return NSMethodSignature.signature(withObjCTypes: typeEncoding!)
+			}
+
+			let previousImpl2 = class_replaceMethod(perceivedClass,
+			                                       ObjCSelector.methodSignatureForSelector,
+			                                       imp_implementationWithBlock(_methodSignatureForSelector),
+			                                       "v@::")
+			precondition(previousImpl2 == nil, "Swizzling DelegateProxy with other libraries is not supported. \(perceivedClass)")
+
+			// If `self` conforms to `objcProtocol`, all required methods should have been
+			// implemented.
+			if class_conformsToProtocol(perceivedClass, objcProtocol) {
+				return
+			}
+
+			// Implement all required methods of the protocol. Trap if any method has
+			// non-void return type, and is not implemented by `self`.
+
+			var count: UInt32 = 0
+			if let list = protocol_copyMethodDescriptionList(objcProtocol, true, true, &count) {
+				let buffer = UnsafeBufferPointer(start: list, count: Int(count))
+				defer { free(list) }
+
+				for method in buffer {
+					// Implemented selectors with matching signatures are picked up by the
+					// proxy even if `self` does not conform to the protocol.
+					if let implementedMethod = class_getImmediateMethod(perceivedClass, method.name),
+					   strcmp(method.types, method_getTypeEncoding(implementedMethod)) == 0 {
+						continue
+					}
+
+					guard method.types.pointee == Int8(UInt8(ascii: "v")) else {
+						fatalError("DelegateProxy does not support protocols with required methods that returns non-void types.")
+					}
+
+					typeEncodings[method.name] = UnsafePointer(method.types!)
+					_ = class_addMethod(perceivedClass, method.name, _rac_objc_msgForward, method.types)
+				}
+			}
+
+			if let list = protocol_copyMethodDescriptionList(objcProtocol, false, true, &count) {
+				let buffer = UnsafeBufferPointer(start: list, count: Int(count))
+				defer { free(list) }
+
+				for method in buffer {
+					typeEncodings[method.name] = UnsafePointer(method.types!)
+				}
+			}
 		}
 	}
 }
@@ -182,6 +239,9 @@ extension Reactive where Base: NSObject {
 	/// After the proxy is initialized, the delegate setter of `instance` would be
 	/// automatically redirected to the proxy.
 	///
+	/// - important: If you subclass `DelegateProxy`, your implementations are responsible
+	///              of forwarding the calls to the forwardee.
+	///
 	/// - warnings: `DelegateProxy` does not support protocols containing methods that are
 	///             non-void returning. It would trap immediately when the proxy
 	///             initializes with a protocol containing such a required method, or when
@@ -191,7 +251,7 @@ extension Reactive where Base: NSObject {
 	///   - key: The key of the property that stores the delegate reference.
 	///
 	/// - returns: The proxy.
-	public func proxy<Delegate: NSObjectProtocol>(_: Delegate.Type = Delegate.self, forKey key: String) -> DelegateProxy<Delegate> {
+	public func proxy<Delegate, Proxy: DelegateProxy<Delegate>>(_: Delegate.Type = Delegate.self, forKey key: String) -> Proxy {
 		func remangleIfNeeded(_ name: String) -> String {
 			let expression = try! NSRegularExpression(pattern: "^([a-zA-Z0-9\\_\\.]+)\\.\\(([a-zA-Z0-9\\_]+)\\sin\\s([a-zA-Z0-9\\_]+)\\)$")
 			if let match = expression.firstMatch(in: name, range: NSMakeRange(0, name.characters.count)) {
@@ -219,25 +279,25 @@ extension Reactive where Base: NSObject {
 
 		return base.synchronized {
 			let getter = Selector(((key)))
-			let setter = Selector((("set\(key.capitalized):")))
+			let setter = Selector((("set\(String(key.characters.first!).uppercased())\(String(key.characters.dropFirst())):")))
 
 			let proxyKey = AssociationKey<AnyObject?>(setter.delegateProxyAlias)
 
 			if let proxy = base.associations.value(forKey: proxyKey) {
-				return proxy as! DelegateProxy<Delegate>
+				return proxy as! Proxy
 			}
 
 			let superclass: AnyClass = class_getSuperclass(swizzleClass(base))
 
-			let invokeSuperSetter: @convention(c) (NSObject, AnyClass, Selector, AnyObject?) -> Void = { object, superclass, selector, delegate in
-				typealias Setter = @convention(c) (NSObject, Selector, AnyObject?) -> Void
+			let invokeSuperSetter: @convention(c) (Unmanaged<AnyObject>, AnyClass, Selector, Unmanaged<AnyObject>?) -> Void = { object, superclass, selector, delegate in
+				typealias Setter = @convention(c) (Unmanaged<AnyObject>, Selector, Unmanaged<AnyObject>?) -> Void
 				let impl = class_getMethodImplementation(superclass, selector)
 				unsafeBitCast(impl, to: Setter.self)(object, selector, delegate)
 			}
 
-			let newSetterImpl: @convention(block) (NSObject, AnyObject?) -> Void = { object, delegate in
-				if let proxy = object.associations.value(forKey: proxyKey) as! DelegateProxy<Delegate>? {
-					proxy.forwardee = (delegate as! Delegate?)
+			let newSetterImpl: @convention(block) (Unmanaged<AnyObject>, Unmanaged<AnyObject>?) -> Void = { object, delegate in
+				if let proxy = Associations(object.takeUnretainedValue()).value(forKey: proxyKey) as! DelegateProxy<Delegate>? {
+					proxy._forwardee = delegate?.takeUnretainedValue()
 				} else {
 					invokeSuperSetter(object, superclass, setter, delegate)
 				}
@@ -250,10 +310,10 @@ extension Reactive where Base: NSObject {
 			// As Objective-C classes may cache the information of their delegate at
 			// the time the delegates are set, the information has to be "flushed"
 			// whenever the proxy forwardee is replaced or a selector is intercepted.
-			let proxy = DelegateProxy<Delegate>(objcProtocol: objcProtocol, lifetime: base.reactive.lifetime) { [weak base] proxy in
+			let proxy = Proxy(config: DelegateProxyConfiguration(objcProtocol: objcProtocol, lifetime: base.reactive.lifetime) { [weak base] proxy in
 				guard let base = base else { return }
-				invokeSuperSetter(base, superclass, setter, proxy)
-			}
+				invokeSuperSetter(.passUnretained(base), superclass, setter, .passUnretained(proxy))
+			})
 
 			typealias Getter = @convention(c) (NSObject, Selector) -> AnyObject?
 			let getterImpl: IMP = class_getMethodImplementation(object_getClass(base), getter)
