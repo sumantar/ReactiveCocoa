@@ -4,7 +4,7 @@ import enum Result.NoError
 import ReactiveSwift
 @testable import ReactiveCocoa
 
-@objc private protocol ObjectDelegate: NSObjectProtocol {
+@objc internal protocol ObjectDelegate: NSObjectProtocol {
 	func foo()
 	@objc optional func bar()
 	@objc optional func nop()
@@ -52,16 +52,6 @@ private class ObjectDelegateCounter: NSObject, ObjectDelegate {
 	}
 }
 
-private class ObjectDelegateProxy: DelegateProxy<ObjectDelegate>, ObjectDelegate {
-	func foo() {
-		forwardee?.foo()
-	}
-
-	func bar() {
-		forwardee?.bar?()
-	}
-}
-
 class DelegateProxySpec: QuickSpec {
 	override func spec() {
 		describe("DelegateProxy") {
@@ -70,9 +60,7 @@ class DelegateProxySpec: QuickSpec {
 
 			beforeEach {
 				object = Object()
-				proxy = ObjectDelegateProxy.proxy(for: object,
-				                                  setter: #selector(setter: object.delegate),
-				                                  getter: #selector(getter: object.delegate))
+				proxy = object.reactive.proxy(forKey: #keyPath(Object.delegate))
 			}
 
 			afterEach {
@@ -99,7 +87,7 @@ class DelegateProxySpec: QuickSpec {
 
 			it("should respond to the protocol requirement checks.") {
 				expect(proxy.responds(to: #selector(ObjectDelegate.foo))) == true
-				expect(proxy.responds(to: #selector(ObjectDelegate.bar))) == true
+				expect(proxy.responds(to: #selector(ObjectDelegate.bar))) == false
 				expect(proxy.responds(to: #selector(ObjectDelegate.nop))) == false
 			}
 
@@ -234,9 +222,7 @@ class DelegateProxySpec: QuickSpec {
 				}
 
 				func setProxy() {
-					proxy = ObjectDelegateProxy.proxy(for: object,
-					                                  setter: #selector(setter: object.delegate),
-					                                  getter: #selector(getter: object.delegate))
+					proxy = object.reactive.proxy(forKey: #keyPath(Object.delegate))
 
 					let signal: Signal<(), NoError> = proxy.reactive.trigger(for: #selector(ObjectDelegate.foo))
 					signal.observeValues { fooCounter += 1 }

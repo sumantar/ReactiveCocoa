@@ -2,21 +2,9 @@ import ReactiveSwift
 import enum Result.NoError
 import UIKit
 
-private class SearchBarDelegateProxy: DelegateProxy<UISearchBarDelegate>, UISearchBarDelegate {
-	@objc func searchBarTextDidEndEditing(_ searchBar: UISearchBar) {
-		forwardee?.searchBarTextDidEndEditing?(searchBar)
-	}
-
-	@objc func searchBar(_ searchBar: UISearchBar, textDidChange searchText: String) {
-		forwardee?.searchBar?(searchBar, textDidChange: searchText)
-	}
-}
-
 extension Reactive where Base: UISearchBar {
-	private var proxy: SearchBarDelegateProxy {
-		return .proxy(for: base,
-		              setter: #selector(setter: base.delegate),
-		              getter: #selector(getter: base.delegate))
+	private var proxy: DelegateProxy<UISearchBarDelegate> {
+		return proxy(forKey: #keyPath(UISearchBar.delegate))
 	}
 
 	/// Sets the text of the search bar.
@@ -29,7 +17,8 @@ extension Reactive where Base: UISearchBar {
 	/// - note: To observe text values that change on all editing events,
 	///   see `continuousTextValues`.
 	public var textValues: Signal<String?, NoError> {
-		return proxy.reactive.trigger(for: #selector(UISearchBarDelegate.searchBarTextDidEndEditing))
+		return proxy.reactive
+			.trigger(for: #selector(proxy.delegateType.searchBarTextDidEndEditing))
 			.map { [unowned base] in base.text }
 	}
 
@@ -37,7 +26,8 @@ extension Reactive where Base: UISearchBar {
 	///
 	/// - note: To observe text values only when editing ends, see `textValues`.
 	public var continuousTextValues: Signal<String?, NoError> {
-		return proxy.reactive.trigger(for: #selector(UISearchBarDelegate.searchBar(_:textDidChange:)))
+		return proxy.reactive
+			.trigger(for: #selector(proxy.delegateType.searchBar(_:textDidChange:)))
 			.map { [unowned base] in base.text }
 	}
 	

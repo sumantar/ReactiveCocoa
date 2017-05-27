@@ -360,7 +360,7 @@ private final class SignatureCache {
 ///   - types: The type encoding C string of the method.
 ///
 /// - returns: `true`.
-private func checkTypeEncoding(_ types: UnsafePointer<CChar>) -> Bool {
+internal func checkTypeEncoding(_ types: UnsafePointer<CChar>) -> Bool {
 	// Some types, including vector types, are not encoded. In these cases the
 	// signature starts with the size of the argument frame.
 	assert(types.pointee < Int8(UInt8(ascii: "1")) || types.pointee > Int8(UInt8(ascii: "9")),
